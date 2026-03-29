@@ -3,21 +3,27 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-def get_data(symbol="GC=F", period="60d", interval="5m"):
+def get_data(file_path="2026.3.29XAUUSD_M1_UTCPlus07-M1-No Session.csv"):
     """
-    ฟังก์ชันดาวน์โหลดข้อมูลจาก yfinance
+    ฟังก์ชันโหลดข้อมูลจาก CSV และ Resample เป็น 5 นาที (M5)
     """
-    data = yf.download(symbol, period=period, interval=interval)
-    data = data.dropna()
+    data = pd.read_csv(file_path)
     
-    # เคลียร์ MultiIndex columns ให้เข้าถึงได้ง่าย
-    if isinstance(data.columns, pd.MultiIndex):
-        if 'Close' in data.columns.get_level_values(0):
-            data.columns = data.columns.get_level_values(0)
-        elif symbol in data.columns.get_level_values(0):
-            data.columns = data.columns.get_level_values(1)
+    # แปลง Date และ Time ให้เป็น Datetime Index
+    data['Datetime'] = pd.to_datetime(data['Date'] + ' ' + data['Time'])
+    data.set_index('Datetime', inplace=True)
+    data.drop(columns=['Date', 'Time'], inplace=True)
+    
+    # Resample ข้อมูล 1 นาที (M1) ให้เป็น 5 นาที (M5) เหมือนของเดิม
+    data_m5 = data.resample('5min').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum'
+    }).dropna()
             
-    return data
+    return data_m5
 
 def calc_indicators(data, lookback=50, atr_period=14):
     """
@@ -42,7 +48,7 @@ def run_backtest(data, risk_per_trade=0.2, atr_mult=2.0, rr=1.5):
     ฟังก์ชันรัน Backtest 
     (ในส่วนนี้มีที่ว่างให้ใส่เงื่อนไขจาก Decision Tree)
     """
-    balance = 100.0
+    balance = 50.0
     initial_balance = balance
     
     equity = []
@@ -65,15 +71,16 @@ def run_backtest(data, risk_per_trade=0.2, atr_mult=2.0, rr=1.5):
         # ===============================================
         # ใส่เงื่อนไข (Rules) ที่ได้จาก Decision Tree ตรงนี้
         # ===============================================
-        # ตลาดอเมริกา (NY Session) มักจะอยู่ในช่วงประมาณ 08:00 - 16:00 
-        # (กราฟของ yfinance อิงตามโซนเวลานิวยอร์ก หรือสามารถปรับชั่วโมงได้ตามสะดวก)
-        is_ny_session = (hour >= 8) and (hour <= 16)
+        # จากภาพ Decision Tree พบว่า "Good trades" จะอยู่ในโหนดขวา:
+        # - ขวาแรก: Hour_of_Day > 6.5 (คือตั้งแต่ 7:00 เป็นต้นไป)
+        # - ถัดลงมา Hour_of_Day <= 21.5 (คือไม่เกิน 21:59) จะลงมาเจอ Class "Hit TP"
+        # - ถ้านอกโหนดนี้ (ไม่ว่าจะ < 6.5 หรือ > 21.5) สุดท้ายไปตกที่ Class "Hit SL" เกือบหมด
         
-        # ขา BUY: 1. ไม่อยู่ใน NY Session และ 2. ATR ไม่โหดเกินไป
-        ml_condition_buy = (not is_ny_session) and (atr <= 9.907)
+        is_good_time = (hour >= 7) and (hour <= 21)
         
-        # ขา SELL: 1. ไม่อยู่ใน NY Session (เพราะถ้านอกเวลานี้ อัตราชนะสูงมาก)
-        ml_condition_sell = (not is_ny_session)
+        # ขา BUY และ SELL ใช้เงื่อนไขเวลาคัดกรองเพื่อให้ความแม่นยำสูงขึ้น
+        ml_condition_buy = is_good_time
+        ml_condition_sell = is_good_time
         
         result = None
         
@@ -110,7 +117,12 @@ def run_backtest(data, risk_per_trade=0.2, atr_mult=2.0, rr=1.5):
         # ตัดยอด Balance ของไม้นี้
         if result is not None:
             trades.append(result)
-            balance *= (1 + result * risk_per_trade)
+            if result == 1:
+                # ชนะ: ได้กำไร = Risk * RR
+                balance *= (1 + (risk_per_trade * rr))
+            else:
+                # แพ้: เสีย = Risk
+                balance *= (1 - risk_per_trade)
             
         equity.append(balance)
         
@@ -122,15 +134,16 @@ def run_backtest(data, risk_per_trade=0.2, atr_mult=2.0, rr=1.5):
 def main():
     print("เริ่มการรัน Backtest...")
     
-    print("1. ดาวน์โหลดข้อมูล (yfinance 'GC=F')...")
-    df = get_data("GC=F", "60d", "5m")
+    print("1. โหลดข้อมูลจากไฟล์ CSV (2026.3.29XAUUSD_M1_UTCPlus07-M1-No Session.csv)...")
+    df = get_data("2026.3.29XAUUSD_M1_UTCPlus07-M1-No Session.csv")
     
     print("2. คำนวณอินดิเคเตอร์ ATR และ Breakout Levels...")
     df = calc_indicators(df, lookback=50, atr_period=14)
     
     print("3. ทำการเทรดจำลอง...")
     # คุณสามารถปรับตั้งค่า RR, ATR Multiplier หรือ % Risk ต่อเทรดได้ที่นี่
-    df_res, trades, init_bal, final_bal = run_backtest(df, risk_per_trade=0.2, atr_mult=2.0, rr=1.5)
+    # แนะนำให้ใช้ความเสี่ยงแค่ 2% ต่อไม้ (0.02)
+    df_res, trades, init_bal, final_bal = run_backtest(df, risk_per_trade=0.1, atr_mult=2.0, rr=1.5)
     
     # 4. สรุปผลการเทรด (Summary)
     trades = np.array(trades)
