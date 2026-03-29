@@ -1,4 +1,3 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -143,7 +142,7 @@ def main():
     print("3. ทำการเทรดจำลอง...")
     # คุณสามารถปรับตั้งค่า RR, ATR Multiplier หรือ % Risk ต่อเทรดได้ที่นี่
     # แนะนำให้ใช้ความเสี่ยงแค่ 2% ต่อไม้ (0.02)
-    df_res, trades, init_bal, final_bal = run_backtest(df, risk_per_trade=0.1, atr_mult=2.0, rr=1.5)
+    df_res, trades, init_bal, final_bal = run_backtest(df, risk_per_trade=0.1, atr_mult=3.0, rr=1.5)
     
     # 4. สรุปผลการเทรด (Summary)
     trades = np.array(trades)
