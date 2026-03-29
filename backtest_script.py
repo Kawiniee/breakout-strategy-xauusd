@@ -37,8 +37,9 @@ def calc_indicators(data, lookback=50, atr_period=14):
     data["HH"] = data["High"].rolling(lookback).max()
     data["LL"] = data["Low"].rolling(lookback).min()
     
-    # เพิ่มเวลา ชั่วโมง เพื่อให้ง่ายต่อการใช้วิเคราะห์ ML 
+    # เพิ่มเวลา ชั่วโมงและวันในสัปดาห์ เพื่อให้ง่ายต่อการใช้วิเคราะห์ ML 
     data['Hour'] = data.index.hour
+    data['DayOfWeek'] = data.index.dayofweek
     
     return data.dropna()
 
@@ -53,33 +54,67 @@ def run_backtest(data, risk_per_trade=0.2, atr_mult=2.0, rr=1.5):
     equity = []
     trades = []
     
-    for i in range(len(data)):
+    # แปลงข้อมูล Column เป็น Numpy Array เพื่อให้ความเร็วในการรันเร็วขึ้น 100 เท่า (ไวกว่า .iloc)
+    closes = data["Close"].values
+    atrs = data["ATR"].values
+    hours = data["Hour"].values
+    day_of_weeks = data["DayOfWeek"].values
+    hhs = data["HH"].values
+    lls = data["LL"].values
+    highs = data["High"].values
+    lows = data["Low"].values
+    
+    length = len(data)
+    
+    for i in range(length):
         # รับข้อมูลดัชนีปัจจุบัน
-        close = data["Close"].iloc[i]
-        atr = data["ATR"].iloc[i]
-        hour = data["Hour"].iloc[i]
+        close = closes[i]
+        atr = atrs[i]
+        hour = hours[i]
         
         # แท่งที่ i ต้องเทียบกับแท่งก่อนหน้า i-1 
         if i < 1:
             equity.append(balance)
             continue
             
-        upper = data["HH"].iloc[i-1] + atr * atr_mult
-        lower = data["LL"].iloc[i-1] - atr * atr_mult
+        upper = hhs[i-1] + atr * atr_mult
+        lower = lls[i-1] - atr * atr_mult
         
         # ===============================================
-        # ใส่เงื่อนไข (Rules) ที่ได้จาก Decision Tree ตรงนี้
+        # ใส่เงื่อนไข (Rules) ที่ได้จาก Decision Tree (อัปเดตใหม่)
         # ===============================================
-        # จากภาพ Decision Tree พบว่า "Good trades" จะอยู่ในโหนดขวา:
-        # - ขวาแรก: Hour_of_Day > 6.5 (คือตั้งแต่ 7:00 เป็นต้นไป)
-        # - ถัดลงมา Hour_of_Day <= 21.5 (คือไม่เกิน 21:59) จะลงมาเจอ Class "Hit TP"
-        # - ถ้านอกโหนดนี้ (ไม่ว่าจะ < 6.5 หรือ > 21.5) สุดท้ายไปตกที่ Class "Hit SL" เกือบหมด
+        # เตรียมตัวแปรสำหรับใช้วิเคราะห์ตาม Tree
+        day_of_week = day_of_weeks[i] # 0=จันทร์, 1=อังคาร, ..., 4=ศุกร์
         
-        is_good_time = (hour >= 7) and (hour <= 21)
+        # กำหนดช่วงเวลา NY Session (อิงเวลาไทย UTC+7) ตลาดเปิดช่วง 19:00
+        is_ny_session = 1 if (hour >= 19 or hour < 4) else 0
         
-        # ขา BUY และ SELL ใช้เงื่อนไขเวลาคัดกรองเพื่อให้ความแม่นยำสูงขึ้น
-        ml_condition_buy = is_good_time
-        ml_condition_sell = is_good_time
+        # แปลงกฎจากภาพ Decision Tree (ซ้ายมือคือ True, ขวามือคือ False)
+        # Root: Session_NY <= 0.5 (คือถ้า ไม่ใช่ NY ไปฝั่งซ้าย ถ้า ใช่ NY ไปฝั่งขวา)
+        is_good_ml = False
+        
+        if is_ny_session == 0: 
+            # ---> ฝั่งซ้ายของ Tree (Not NY)
+            if day_of_week == 0: # โหนด Day_of_Week <= 0.5 (วันจันทร์)
+                # ไม่ว่า Hour <= 5.5 หรือ > 5.5 ก็ให้ค่า Class = Hit TP ทั้งคู่
+                is_good_ml = True
+            else:
+                # วันอังคาร-ศุกร์ ตกโหนด Hit SL ทั้งหมด (ไม่เกินและเกินบ่ายสองครึ่ง)
+                is_good_ml = False
+        else: 
+            # ---> ฝั่งขวาของ Tree (Yes NY)
+            if day_of_week == 0: # วันจันทร์ในเวลา NY 
+                is_good_ml = False # Class = Hit SL
+            else:
+                # วันอังคาร-ศุกร์ ตกโหนด Hour_of_Day <= 22.5
+                if hour <= 22: # 19:00 - 22:59
+                    is_good_ml = True # Class = Hit TP
+                else: 
+                    is_good_ml = False # Class = Hit SL
+                    
+        # ขา BUY และ SELL ใช้เงื่อนไขเดียวกันที่กรองมาแล้ว
+        ml_condition_buy = is_good_ml
+        ml_condition_sell = is_good_ml
         
         result = None
         
@@ -90,11 +125,12 @@ def run_backtest(data, risk_per_trade=0.2, atr_mult=2.0, rr=1.5):
             tp = entry + atr * rr
             
             # จำลองผลกำไร-ขาดทุนในแท่งถัดๆ ไป (สูงสุด 30 แท่ง)
-            for j in range(i+1, min(i+31, len(data))):
-                if data["Low"].iloc[j] <= sl:
+            max_j = min(i+31, length)
+            for j in range(i+1, max_j):
+                if lows[j] <= sl:
                     result = -1  # ขาดทุน
                     break
-                if data["High"].iloc[j] >= tp:
+                if highs[j] >= tp:
                     result = 1   # กำไร
                     break
                     
@@ -105,11 +141,12 @@ def run_backtest(data, risk_per_trade=0.2, atr_mult=2.0, rr=1.5):
             tp = entry - atr * rr
             
             # จำลองผลกำไร-ขาดทุนในแท่งถัดๆ ไป (สูงสุด 30 แท่ง)
-            for j in range(i+1, min(i+31, len(data))):
-                if data["High"].iloc[j] >= sl:
+            max_j = min(i+31, length)
+            for j in range(i+1, max_j):
+                if highs[j] >= sl:
                     result = -1  # ขาดทุน
                     break
-                if data["Low"].iloc[j] <= tp:
+                if lows[j] <= tp:
                     result = 1   # กำไร
                     break
                     
